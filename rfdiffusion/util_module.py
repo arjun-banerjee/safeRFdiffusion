@@ -251,7 +251,7 @@ class ComputeAllAtomCoords(nn.Module):
         self.RTs_in_base_frame = nn.Parameter(RTs_by_torsion, requires_grad=False)
         self.xyzs_in_base_frame = nn.Parameter(xyzs_in_base_frame, requires_grad=False)
 
-    def forward(self, seq, xyz, alphas, non_ideal=False, use_H=True):
+    def forward(self, seq, xyz, alphas, non_ideal=False, use_H=True, seq_idx = None):
         B,L = xyz.shape[:2]
 
         Rs, Ts = rigid_from_3_points(xyz[...,0,:],xyz[...,1,:],xyz[...,2,:], non_ideal=non_ideal)

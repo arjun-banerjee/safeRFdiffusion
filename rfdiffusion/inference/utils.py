@@ -54,8 +54,8 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
     R_t, Ca_t = rigid_from_3_points(N_t, Ca_t, C_t)
 
     # this must be to normalize them or something
-    R_0 = scipy_R.from_matrix(R_0.squeeze().numpy()).as_matrix()
-    R_t = scipy_R.from_matrix(R_t.squeeze().numpy()).as_matrix()
+    R_0 = scipy_R.from_matrix(R_0.cpu().detach().squeeze().numpy()).as_matrix()
+    R_t = scipy_R.from_matrix(R_t.cpu().detach().squeeze().numpy()).as_matrix()
 
     L = R_t.shape[0]
     all_rot_transitions = np.broadcast_to(np.identity(3), (L, 3, 3)).copy()
@@ -78,14 +78,11 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
     all_rot_transitions = all_rot_transitions[:, None, :, :]
 
     # Apply the interpolated rotation matrices to the coordinates
-    next_crds = (
-        np.einsum(
-            "lrij,laj->lrai",
-            all_rot_transitions,
-            xt[:, :3, :] - Ca_t.squeeze()[:, None, ...].numpy(),
-        )
-        + Ca_t.squeeze()[:, None, None, ...].numpy()
-    )
+    next_crds = np.einsum(
+        "lrij,laj->lrai",
+        all_rot_transitions,
+        (xt[:, :3, :] - Ca_t.detach().squeeze()[:, None, ...]).detach().cpu().numpy()
+    ) + Ca_t.detach().squeeze().cpu().numpy()[:, None, None, :]
 
     # (L,3,3) set of backbone coordinates with slight rotation
     return next_crds.squeeze(1)
@@ -163,6 +160,8 @@ def get_next_ca(
     mu, sigma = get_mu_xt_x0(
         xt, px0, t, beta_schedule=beta_schedule, alphabar_schedule=alphabar_schedule
     )
+    mu = mu.to(xt.device)
+    sigma = sigma.to(xt.device)
 
     sampled_crds = torch.normal(mu, torch.sqrt(sigma * noise_scale))
     delta = sampled_crds - xt[:, 1, :]  # check sign of this is correct
@@ -292,73 +291,86 @@ class Denoise:
 
     def align_to_xt_motif(self, px0, xT, diffusion_mask, eps=1e-6):
         """
-        Need to align px0 to motif in xT. This is to permit the swapping of residue positions in the px0 motif for the true coordinates.
-        First, get rotation matrix from px0 to xT for the motif residues.
-        Second, rotate px0 (whole structure) by that rotation matrix
-        Third, centre at origin
+        Differentiable version of align_to_xt_motif.
+        Align px0 to motif in xT using Kabsch algorithm.
         """
-
         def rmsd(V, W, eps=0):
             # First sum down atoms, then sum down xyz
             N = V.shape[-2]
-            return np.sqrt(np.sum((V - W) * (V - W), axis=(-2, -1)) / N + eps)
+            return torch.sqrt(torch.sum((V - W) * (V - W), dim=(-2, -1)) / N + eps)
 
         assert (
             xT.shape[1] == px0.shape[1]
         ), f"xT has shape {xT.shape} and px0 has shape {px0.shape}"
 
-        L, n_atom, _ = xT.shape  # A is number of atoms
-        atom_mask = ~torch.isnan(px0)
-        # convert to numpy arrays
-        px0 = px0.cpu().detach().numpy()
-        xT = xT.cpu().detach().numpy()
-        diffusion_mask = diffusion_mask.cpu().detach().numpy()
+        L, n_atom, _ = xT.shape
+        device = px0.device
+        dtype = px0.dtype
+        
+        atom_mask = ~torch.isnan(px0).to(device)
+        
+        # Ensure diffusion_mask is on the same device
+        diffusion_mask = diffusion_mask.to(device)
+        xT = xT.to(atom_mask.device)
 
-        # 1 centre motifs at origin and get rotation matrix
-        px0_motif = px0[diffusion_mask, :3].reshape(-1, 3)
-        xT_motif = xT[diffusion_mask, :3].reshape(-1, 3)
-        px0_motif_mean = np.copy(px0_motif.mean(0))  # need later
-        xT_motif_mean = np.copy(xT_motif.mean(0))
+        
+        # # Convert nans to 0 for masked positions
+        # print(f"atom_mask: {atom_mask.device}, xT: {xT.device}")
 
-        # center at origin
-        px0_motif = px0_motif - px0_motif_mean
-        xT_motif = xT_motif - xT_motif_mean
+        px0_masked = torch.where(atom_mask, px0, torch.zeros_like(px0))
+        xT_masked = torch.where(atom_mask, xT, torch.zeros_like(xT))
 
-        # A = px0_motif
-        # B = xT_motif
-        A = xT_motif
-        B = px0_motif
+        # 1. Centre motifs at origin and get rotation matrix
+        # Extract backbone atoms (N, CA, C) - first 3 atoms
+        px0_motif = px0_masked[diffusion_mask, :3].reshape(-1, 3)
+        xT_motif = xT_masked[diffusion_mask, :3].reshape(-1, 3)
+        
+        px0_motif_mean = px0_motif.mean(dim=0)  # need later
+        xT_motif_mean = xT_motif.mean(dim=0)
 
-        C = np.matmul(A.T, B)
+        # Center at origin
+        px0_motif_centered = px0_motif - px0_motif_mean
+        xT_motif_centered = xT_motif - xT_motif_mean
 
-        # compute optimal rotation matrix using SVD
-        U, S, Vt = np.linalg.svd(C)
+        # Kabsch algorithm for optimal rotation matrix
+        # Using xT_motif as reference (A) and px0_motif as to-be-rotated (B)
+        A = xT_motif_centered
+        B = px0_motif_centered
 
-        # ensure right handed coordinate system
-        d = np.eye(3)
-        d[-1, -1] = np.sign(np.linalg.det(Vt.T @ U.T))
+        # Compute covariance matrix
+        C = torch.matmul(A.T, B)
 
-        # construct rotation matrix
+        # Compute optimal rotation matrix using SVD
+        U, S, Vt = torch.linalg.svd(C)
+
+        # Ensure right-handed coordinate system
+        d = torch.eye(3, device=device, dtype=dtype)
+        det = torch.det(Vt.T @ U.T)
+        d[-1, -1] = torch.sign(det)
+
+        # Construct rotation matrix
         R = Vt.T @ d @ U.T
 
-        # get rotated coords
+        # Get rotated coords
         rB = B @ R
 
-        # calculate rmsd
+        # Calculate RMSD
         rms = rmsd(A, rB)
         self._log.info(f"Sampled motif RMSD: {rms:.2f}")
 
-        # 2 rotate whole px0 by rotation matrix
-        atom_mask = atom_mask.cpu()
-        px0[~atom_mask] = 0  # convert nans to 0
-        px0 = px0.reshape(-1, 3) - px0_motif_mean
-        px0_ = px0 @ R
+        # 2. Rotate whole px0 by rotation matrix
+        px0_flat = px0_masked.reshape(-1, 3) - px0_motif_mean
+        px0_rotated = px0_flat @ R
 
-        # 3 put in same global position as xT
-        px0_ = px0_ + xT_motif_mean
-        px0_ = px0_.reshape([L, n_atom, 3])
-        px0_[~atom_mask] = float("nan")
-        return torch.Tensor(px0_)
+        # 3. Put in same global position as xT
+        px0_aligned = px0_rotated + xT_motif_mean
+        px0_aligned = px0_aligned.reshape([L, n_atom, 3])
+        
+        # Restore NaN values for masked positions
+        nan_tensor = torch.tensor(float('nan'), device=device, dtype=dtype)
+        px0_aligned = torch.where(atom_mask, px0_aligned, nan_tensor)
+        
+        return px0_aligned
 
     def get_potential_gradients(self, xyz, diffusion_mask):
         """
@@ -434,7 +446,6 @@ class Denoise:
 
             include_motif_sidechains (bool): Provide sidechains of the fixed motif to the model
         """
-
         get_allatom = ComputeAllAtomCoords().to(device=xt.device)
         L, n_atom = xt.shape[:2]
         assert (xt.shape[1] == 14) or (xt.shape[1] == 27)
@@ -483,12 +494,12 @@ class Denoise:
 
         grad_ca = self.get_potential_gradients(
             xt.clone(), diffusion_mask=diffusion_mask
-        )
+        ).to(xt.device)
 
         ca_deltas += self.potential_manager.get_guide_scale(t) * grad_ca
 
         # add the delta to the new frames
-        frames_next = torch.from_numpy(frames_next) + ca_deltas[:, None, :]  # translate
+        frames_next = torch.from_numpy(frames_next).to(xt.device) + ca_deltas[:, None, :].to(xt.device)  # translate
 
         fullatom_next = torch.full_like(xt, float("nan")).unsqueeze(0)
         fullatom_next[:, :, :3] = frames_next[None]

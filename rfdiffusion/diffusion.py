@@ -285,7 +285,7 @@ class IGSO3:
             )
         else:
             raise ValueError(f"Unrecognize schedule {self.schedule}")
-
+            
     def g(self, t):
         """
         g returns the drift coefficient at time t
@@ -301,10 +301,17 @@ class IGSO3:
         Returns:
             drift cooeficient as a scalar.
         """
-        t = torch.tensor(t, requires_grad=True)
-        sigma_sqr = self.sigma(t) ** 2
-        grads = torch.autograd.grad(sigma_sqr.sum(), t)[0]
-        return torch.sqrt(grads)
+        # Temporarily enable gradients for this calculation
+        # even if called from within torch.no_grad()
+        with torch.enable_grad():
+            t_tensor = torch.tensor(t, requires_grad=True, dtype=torch.float32)
+            sigma_sqr = self.sigma(t_tensor) ** 2
+            grads = torch.autograd.grad(sigma_sqr.sum(), t_tensor)[0]
+        
+        # Return without gradients (just the value)
+        return torch.sqrt(grads).detach()
+
+
 
     def sample(self, ts, n_samples=1):
         """

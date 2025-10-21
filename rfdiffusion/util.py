@@ -15,39 +15,82 @@ def generate_Cbeta(N, Ca, C):
 
     return Cb
 
+import torch
 
-def th_ang_v(ab, bc, eps: float = 1e-8):
-    def th_norm(x, eps: float = 1e-8):
-        return x.square().sum(-1, keepdim=True).add(eps).sqrt()
+def th_ang_v(ab, bc, eps: float = 1e-8, tiny: float = 1e-7):
+    # 1) Sanitize raw inputs so NaNs never reach the multiply
+    ab = torch.nan_to_num(ab, nan=0.0, posinf=0.0, neginf=0.0)
+    bc = torch.nan_to_num(bc, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def th_N(x, alpha: float = 0):
-        return x / th_norm(x).add(alpha)
+    # 2) Norms + validity (finite + non-degenerate)
+    ab_norm = ab.square().sum(dim=-1, keepdim=True).add(eps).sqrt()
+    bc_norm = bc.square().sum(dim=-1, keepdim=True).add(eps).sqrt()
+    finite = torch.isfinite(ab).all(dim=-1) & torch.isfinite(bc).all(dim=-1)
+    nondeg = (ab_norm[..., 0] > tiny) & (bc_norm[..., 0] > tiny)
+    valid = finite & nondeg
 
-    ab, bc = th_N(ab), th_N(bc)
-    cos_angle = torch.clamp((ab * bc).sum(-1), -1, 1)
-    sin_angle = torch.sqrt(1 - cos_angle.square() + eps)
-    dih = torch.stack((cos_angle, sin_angle), -1)
-    return dih
+    # 3) Zero-out invalid vectors BEFORE normalization to avoid NaNs/Infs later
+    ab = torch.where(valid[..., None], ab, torch.zeros_like(ab))
+    bc = torch.where(valid[..., None], bc, torch.zeros_like(bc))
+
+    # 4) Normalize (safe)
+    ab_u = ab / ab_norm.clamp_min(tiny)
+    bc_u = bc / bc_norm.clamp_min(tiny)
+
+    # 5) Second safety pass: guarantee finiteness pre-multiply
+    ab_u = torch.where(torch.isfinite(ab_u), ab_u, torch.zeros_like(ab_u))
+    bc_u = torch.where(torch.isfinite(bc_u), bc_u, torch.zeros_like(bc_u))
+
+    # 6) Dot, clamp
+    cos = (ab_u * bc_u).sum(dim=-1).clamp(-1.0, 1.0)
+
+    # 7) sin from cos, sqrt-safe
+    sin_sq = (1.0 - cos.square()).clamp_min(0.0)
+    sin = torch.sqrt(sin_sq + eps)
+
+    # 8) For invalid entries, return angle 0 -> (cos=1, sin=0)
+    cos = torch.where(valid, cos, cos.new_ones(cos.shape))
+    sin = torch.where(valid, sin, sin.new_zeros(sin.shape))
+
+    return torch.stack((cos, sin), dim=-1)
 
 
-def th_dih_v(ab, bc, cd):
+
+
+def th_dih_v(ab, bc, cd, eps: float = 1e-8, tiny: float = 1e-7):
     def th_cross(a, b):
         a, b = torch.broadcast_tensors(a, b)
         return torch.cross(a, b, dim=-1)
 
-    def th_norm(x, eps: float = 1e-8):
+    def th_norm(x):
         return x.square().sum(-1, keepdim=True).add(eps).sqrt()
 
-    def th_N(x, alpha: float = 0):
-        return x / th_norm(x).add(alpha)
+    def th_N(x):
+        return x / th_norm(x).clamp_min(tiny)
 
+    # --- Sanitize inputs first ---
+    ab = torch.nan_to_num(ab, nan=0.0, posinf=0.0, neginf=0.0)
+    bc = torch.nan_to_num(bc, nan=0.0, posinf=0.0, neginf=0.0)
+    cd = torch.nan_to_num(cd, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # --- Normalize each vector safely ---
     ab, bc, cd = th_N(ab), th_N(bc), th_N(cd)
+
+    # --- Compute plane normals ---
     n1 = th_N(th_cross(ab, bc))
     n2 = th_N(th_cross(bc, cd))
-    sin_angle = (th_cross(n1, bc) * n2).sum(-1)
-    cos_angle = (n1 * n2).sum(-1)
-    dih = torch.stack((cos_angle, sin_angle), -1)
-    return dih
+
+    # --- Safe cosine & sine ---
+    cos_angle = (n1 * n2).sum(-1).clamp(-1.0, 1.0)
+    sin_angle = (th_cross(n1, bc) * n2).sum(-1).clamp(-1.0, 1.0)
+
+    # --- Replace any invalid results (NaNs/Infs) with angle=0 (cos=1, sin=0) ---
+    invalid = ~(torch.isfinite(cos_angle) & torch.isfinite(sin_angle))
+    cos_angle = torch.where(invalid, torch.ones_like(cos_angle), cos_angle)
+    sin_angle = torch.where(invalid, torch.zeros_like(sin_angle), sin_angle)
+
+    return torch.stack((cos_angle, sin_angle), -1)
+
 
 
 def th_dih(a, b, c, d):
@@ -168,18 +211,18 @@ def get_torsions(
     )
 
     # chis
-    ti0 = torch.gather(xyz, 2, torsion_indices[seq, :, 0, None].repeat(1, 1, 1, 3))
-    ti1 = torch.gather(xyz, 2, torsion_indices[seq, :, 1, None].repeat(1, 1, 1, 3))
-    ti2 = torch.gather(xyz, 2, torsion_indices[seq, :, 2, None].repeat(1, 1, 1, 3))
-    ti3 = torch.gather(xyz, 2, torsion_indices[seq, :, 3, None].repeat(1, 1, 1, 3))
+    ti0 = torch.gather(xyz, 2, torsion_indices[seq, :, 0, None].repeat(1, 1, 1, 3).to(xyz.device))
+    ti1 = torch.gather(xyz, 2, torsion_indices[seq, :, 1, None].repeat(1, 1, 1, 3).to(xyz.device))
+    ti2 = torch.gather(xyz, 2, torsion_indices[seq, :, 2, None].repeat(1, 1, 1, 3).to(xyz.device))
+    ti3 = torch.gather(xyz, 2, torsion_indices[seq, :, 3, None].repeat(1, 1, 1, 3).to(xyz.device))
     torsions[:, :, 3:7, :] = th_dih(ti0, ti1, ti2, ti3)
 
     # CB bend
     NC = 0.5 * (xyz[:, :, 0, :3] + xyz[:, :, 2, :3])
     CA = xyz[:, :, 1, :3]
     CB = xyz[:, :, 4, :3]
-    t = th_ang_v(CB - CA, NC - CA)
-    t0 = ref_angles[seq][..., 0, :]
+    t = th_ang_v(CB - CA, NC - CA).to(xyz.device)
+    t0 = ref_angles[seq][..., 0, :].to(xyz.device)
     torsions[:, :, 7, :] = torch.stack(
         (torch.sum(t * t0, dim=-1), t[..., 0] * t0[..., 1] - t[..., 1] * t0[..., 0]),
         dim=-1,
@@ -194,8 +237,8 @@ def get_torsions(
         / torch.sum(NCCA * NCCA, dim=-1, keepdim=True)
         * NCCA
     )
-    t = th_ang_v(CB - CA, NCpp)
-    t0 = ref_angles[seq][..., 1, :]
+    t = th_ang_v(CB - CA, NCpp).to(xyz.device)
+    t0 = ref_angles[seq][..., 1, :].to(xyz.device)
     torsions[:, :, 8, :] = torch.stack(
         (torch.sum(t * t0, dim=-1), t[..., 0] * t0[..., 1] - t[..., 1] * t0[..., 0]),
         dim=-1,
@@ -203,8 +246,8 @@ def get_torsions(
 
     # CG bend
     CG = xyz[:, :, 5, :3]
-    t = th_ang_v(CG - CB, CA - CB)
-    t0 = ref_angles[seq][..., 2, :]
+    t = th_ang_v(CG - CB, CA - CB).to(xyz.device)
+    t0 = ref_angles[seq][..., 2, :].to(xyz.device)
     torsions[:, :, 9, :] = torch.stack(
         (torch.sum(t * t0, dim=-1), t[..., 0] * t0[..., 1] - t[..., 1] * t0[..., 0]),
         dim=-1,

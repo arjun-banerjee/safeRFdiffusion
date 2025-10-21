@@ -43,8 +43,8 @@ def get_ang(a, b, c):
     """
     v = a - b
     w = c - b
-    v /= torch.norm(v, dim=-1, keepdim=True)
-    w /= torch.norm(w, dim=-1, keepdim=True)
+    v = v / torch.norm(v, dim=-1, keepdim=True)
+    w = w / torch.norm(w, dim=-1, keepdim=True)
     vw = torch.sum(v*w, dim=-1)
 
     return torch.acos(vw)
@@ -72,7 +72,7 @@ def get_dih(a, b, c, d):
     b1 = c - b
     b2 = d - c
 
-    b1 /= torch.norm(b1, dim=-1, keepdim=True)
+    b1 = b1 / torch.norm(b1, dim=-1, keepdim=True)
 
     v = b0 - torch.sum(b0*b1, dim=-1, keepdim=True)*b1
     w = b2 - torch.sum(b2*b1, dim=-1, keepdim=True)*b1
@@ -86,47 +86,40 @@ def get_dih(a, b, c, d):
 
 # ============================================================
 def xyz_to_c6d(xyz, params=PARAMS):
-    """convert cartesian coordinates into 2d distance 
-    and orientation maps
-    
-    Parameters
-    ----------
-    xyz : pytorch tensor of shape [batch,nres,3,3]
-          stores Cartesian coordinates of backbone N,Ca,C atoms
-    Returns
-    -------
-    c6d : pytorch tensor of shape [batch,nres,nres,4]
-          stores stacked dist,omega,theta,phi 2D maps 
-    """
-    
     batch = xyz.shape[0]
-    nres = xyz.shape[1]
+    nres  = xyz.shape[1]
 
-    # three anchor atoms
     N  = xyz[:,:,0]
     Ca = xyz[:,:,1]
     C  = xyz[:,:,2]
     Cb = generate_Cbeta(N, Ca, C)
 
-    # 6d coordinates order: (dist,omega,theta,phi)
-    c6d = torch.zeros([batch,nres,nres,4],dtype=xyz.dtype,device=xyz.device)
+    c6d = torch.zeros([batch,nres,nres,4], dtype=xyz.dtype, device=xyz.device)
 
-    dist = get_pair_dist(Cb,Cb)
-    dist[torch.isnan(dist)] = 999.9
-    c6d[...,0] = dist + 999.9*torch.eye(nres,device=xyz.device)[None,...]
-    b,i,j = torch.where(c6d[...,0]<params['DMAX'])
+    # --- DO NOT mutate cdist output in-place ---
+    dist = get_pair_dist(Cb, Cb)  # (B,L,L), grad_fn=CdistBackward0
+    # Replace NaNs functionally (no in-place writes to dist)
+    dist = torch.where(torch.isnan(dist), torch.full_like(dist, 999.9), dist)
+    # If you want to alter the diagonal, do it functionally as well:
+    eye = torch.eye(nres, dtype=xyz.dtype, device=xyz.device)[None, ...]
+    dist = dist + 999.9 * eye
 
-    c6d[b,i,j,torch.full_like(b,1)] = get_dih(Ca[b,i], Cb[b,i], Cb[b,j], Ca[b,j])
-    c6d[b,i,j,torch.full_like(b,2)] = get_dih(N[b,i], Ca[b,i], Cb[b,i], Cb[b,j])
-    c6d[b,i,j,torch.full_like(b,3)] = get_ang(Ca[b,i], Cb[b,i], Cb[b,j])
+    c6d[..., 0] = dist
 
-    # fix long-range distances
-    c6d[...,0][c6d[...,0]>=params['DMAX']] = 999.9
-    
-    mask = torch.zeros((batch, nres,nres), dtype=xyz.dtype, device=xyz.device)
-    mask[b,i,j] = 1.0
+    b, i, j = torch.where(c6d[..., 0] < params['DMAX'])
+
+    c6d[b, i, j, torch.full_like(b, 1)] = get_dih(Ca[b, i], Cb[b, i], Cb[b, j], Ca[b, j])
+    c6d[b, i, j, torch.full_like(b, 2)] = get_dih(N[b, i], Ca[b, i], Cb[b, i], Cb[b, j])
+    c6d[b, i, j, torch.full_like(b, 3)] = get_ang(Ca[b, i], Cb[b, i], Cb[b, j])
+
+    # This is OK (c6d is your own tensor, not a cdist result)
+    c6d[..., 0][c6d[..., 0] >= params['DMAX']] = 999.9
+
+    mask = torch.zeros((batch, nres, nres), dtype=xyz.dtype, device=xyz.device)
+    mask[b, i, j] = 1.0
     return c6d, mask
-    
+
+
 def xyz_to_t2d(xyz_t, params=PARAMS):
     """convert template cartesian coordinates into 2d distance 
     and orientation maps
@@ -206,12 +199,14 @@ def xyz_to_bbtor(xyz, params=PARAMS):
 
 # ============================================================
 def dist_to_onehot(dist, params=PARAMS):
-    dist[torch.isnan(dist)] = 999.9
+    # Functional NaN replacement (no in-place)
+    dist_clean = torch.where(torch.isnan(dist), torch.full_like(dist, 999.9), dist)
     dstep = (params['DMAX'] - params['DMIN']) / params['DBINS']
-    dbins = torch.linspace(params['DMIN']+dstep, params['DMAX'], params['DBINS'],dtype=dist.dtype,device=dist.device)
-    db = torch.bucketize(dist.contiguous(),dbins).long()
-    dist = torch.nn.functional.one_hot(db, num_classes=params['DBINS']+1).float()
-    return dist
+    dbins = torch.linspace(params['DMIN'] + dstep, params['DMAX'],
+                           params['DBINS'], dtype=dist.dtype, device=dist.device)
+    db = torch.bucketize(dist_clean.contiguous(), dbins).long()
+    return torch.nn.functional.one_hot(db, num_classes=params['DBINS'] + 1).float()
+
 
 def c6d_to_bins(c6d,params=PARAMS):
     """bin 2d distance and orientation maps

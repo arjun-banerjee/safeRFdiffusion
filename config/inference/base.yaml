@@ -12,7 +12,7 @@ inference:
   output_prefix: samples/design
   write_trajectory: True
   scaffold_guided: False
-  model_runner: SelfConditioning
+  model_runner: default
   cautious: True
   align_motif: True
   symmetric_self_cond: True

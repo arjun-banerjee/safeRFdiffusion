@@ -25,6 +25,16 @@ TOR_INDICES  = util.torsion_indices
 TOR_CAN_FLIP = util.torsion_can_flip
 REF_ANGLES   = util.reference_angles
 
+def gumbel_softmax_sample(logits, temperature=0.1, hard=True):
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+    y = (logits + gumbel_noise) / temperature
+    y_soft = torch.softmax(y, dim=-1)
+    if hard:
+        y_hard = torch.zeros_like(y_soft)
+        y_hard.scatter_(-1, torch.argmax(y_soft, dim=-1, keepdim=True), 1.0)
+        return y_hard - y_soft.detach() + y_soft
+    return y_soft
+
 
 class Sampler:
 
@@ -542,10 +552,13 @@ class Sampler:
         if self.preprocess_conf.sidechain_input:
             xyz_t[torch.where(seq == 21, True, False),3:,:] = float('nan')
         else:
+            xyz_t = xyz_t.clone()
             xyz_t[~self.mask_str.squeeze(),3:,:] = float('nan')
 
+
+            
         xyz_t=xyz_t[None, None]
-        xyz_t = torch.cat((xyz_t, torch.full((1,1,L,13,3), float('nan'))), dim=3)
+        xyz_t = torch.cat((xyz_t, torch.full((1,1,L,13,3), float('nan')).to(xyz_t.device)), dim=3)
 
         ###########
         ### t2d ###
@@ -562,6 +575,9 @@ class Sampler:
         ###############
         seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
         alpha, _, alpha_mask, _ = util.get_torsions(xyz_t.reshape(-1, L, 27, 3), seq_tmp, TOR_INDICES, TOR_CAN_FLIP, REF_ANGLES)
+        # Move to device before any ops
+        alpha = alpha.to(self.device)
+        alpha_mask = alpha_mask.to(self.device)
         alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0]))
         alpha[torch.isnan(alpha)] = 0.0
         alpha = alpha.reshape(1,-1,L,10,2)
@@ -600,7 +616,7 @@ class Sampler:
 
         return msa_masked, msa_full, seq[None], torch.squeeze(xyz_t, dim=0), idx, t1d, t2d, xyz_t, alpha_t
         
-    def sample_step(self, *, t, x_t, seq_init, final_step):
+    def sample_step(self, *, t, x_t, seq_init, final_step, enable_grad = False):
         '''Generate the next pose that the model should be supplied at timestep t-1.
 
         Args:
@@ -628,7 +644,13 @@ class Sampler:
         pair_prev = None
         state_prev = None
 
-        with torch.no_grad():
+
+        if enable_grad:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        with torch.set_grad_enabled(enable_grad):
             msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.model(msa_masked,
                                 msa_full,
                                 seq_in,
@@ -644,17 +666,21 @@ class Sampler:
                                 t=torch.tensor(t),
                                 return_infer=True,
                                 motif_mask=self.diffusion_mask.squeeze().to(self.device))
+                    # prediction of X0 
+            print("model px0 grad:", px0.requires_grad)   # px0 before allatom
+            _, px0  = self.allatom(torch.argmax(seq_in, dim=-1), px0, alpha)
+            px0    = px0.squeeze()[:,:14]
+            print("after allatom grad:", px0.requires_grad)
 
-        # prediction of X0 
-        _, px0  = self.allatom(torch.argmax(seq_in, dim=-1), px0, alpha)
-        px0    = px0.squeeze()[:,:14]
+
+
         
         #####################
         ### Get next pose ###
         #####################
         
         if t > final_step:
-            seq_t_1 = nn.one_hot(seq_init,num_classes=22).to(self.device)
+            seq_t_1 = nn.one_hot(seq_init.long(),num_classes=22).to(self.device)
             x_t_1, px0 = self.denoiser.get_next_pose(
                 xt=x_t,
                 px0=px0,
@@ -666,6 +692,9 @@ class Sampler:
             x_t_1 = torch.clone(px0).to(x_t.device)
             seq_t_1 = torch.clone(seq_init)
             px0 = px0.to(x_t.device)
+        
+        print("after pose:", px0.requires_grad)
+
 
         if self.symmetry is not None:
             x_t_1, seq_t_1 = self.symmetry.apply_symmetry(x_t_1, seq_t_1)
