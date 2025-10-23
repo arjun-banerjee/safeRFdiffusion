@@ -199,6 +199,7 @@ class RFDiffusionErasureTeacherStudent:
             atom_mask = torch.full((L, 14), False, dtype=torch.bool, device=device)
             atom_mask[:, :14] = True
             motif_mask = torch.argmax(seq_init, dim=-1) != 21
+
             diffusion_mask = ~motif_mask
 
             fa_stack, _ = teacher_cond.diffuser.diffuse_pose(
@@ -284,25 +285,36 @@ class RFDiffusionErasureTeacherStudent:
         # Compute concept adjustment (detached teacher outputs)
         concept_adj = self.eta * (px0_cond - px0_uncond)
         target = px0_uncond - concept_adj
+
+        # Option 1: Normalize to prevent explosion
+        px0_uncond_norm = px0_uncond.norm(dim=-1, keepdim=True)
+        target_norm = target.norm(dim=-1, keepdim=True)
         
-        # Create scaffold mask (where we want to apply erasure)
-        scaffold_mask = (~motif_mask).float().unsqueeze(-1).unsqueeze(-1).to(device)
+        # Scale target to have similar magnitude as frozen_uncond
+        scale_factor = px0_uncond_norm / (target_norm + 1e-8)
+        scale_factor = torch.clamp(scale_factor, 0.1, 2.0)
         
+        stable_target = target * scale_factor
+        
+        # Create scaffold mask (where we want to apply erasure), we apply loss over the conditioned mofits
+        # Key: MOTIF_MASK covers the elements that are instructed to stay. We move the guess away from this direction
+        # As such, 
+        scaffold_mask = (motif_mask).float().unsqueeze(-1).unsqueeze(-1).to(device)
+
+    
         # Compute masked loss
-        element_loss = (px0_student - target.detach()) ** 2  # Detach target
+        element_loss = (px0_student - stable_target.detach()) ** 2 * 0.01  # Detach target
         masked_loss = element_loss * scaffold_mask
         valid = scaffold_mask.sum()
         
         if valid > 0:
             loss = masked_loss.sum() / valid
         else:
-            # If no scaffold residues, create a dummy loss with gradient
-            loss = (px0_student ** 2).sum() * 0.0
-            loss.requires_grad_(True)
-        print("loss.requires_grad:", loss.requires_grad)
-        print("loss.grad_fn:", loss.grad_fn)
-        print("px0_student.requires_grad:", px0_student.requires_grad)
-        print("px0_student.grad_fn:", px0_student.grad_fn)
+            RuntimeError
+        # print("loss.requires_grad:", loss.requires_grad)
+        # print("loss.grad_fn:", loss.grad_fn)
+        # print("px0_student.requires_grad:", px0_student.requires_grad)
+        # print("px0_student.grad_fn:", px0_student.grad_fn)
 
 
         
@@ -575,9 +587,9 @@ def main():
     OUTPUT_DIR = "finetuned_checkpoints"
     
     # Training hyperparameters
-    ETA = 0.5
-    LEARNING_RATE = 1e-5
-    NUM_STEPS = 20
+    ETA = 5
+    LEARNING_RATE = 1e-6
+    NUM_STEPS = 100
     BATCH_SIZE = 1
     
     # Check paths
@@ -599,7 +611,7 @@ def main():
     ]
     
     contig_strings = [
-        "1/A80-90/1",
+        "1/A80-90",
     ]
     
     descriptions = [
@@ -646,7 +658,7 @@ def main():
             eta=ETA,
             learning_rate=LEARNING_RATE,
             warmup_steps=20,
-            max_grad_norm=30
+            max_grad_norm=10
         )
     except Exception as e:
         logger.error(f"Failed to initialize: {e}")
